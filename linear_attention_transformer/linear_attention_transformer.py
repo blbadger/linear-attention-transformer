@@ -233,10 +233,9 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3, 
     k = torch.exp(k).type(dtype).clone()
 
     q = q * e ** -0.5
-    # if toeplitz_weight is not None:
-    #     # print ('Toep weight applied')
-    #     w = torch.unsqueeze(toeplitz_weight, dim=-1)
-    #     k *= w
+    if toeplitz_weight is not None:
+        w = torch.unsqueeze(toeplitz_weight, dim=-1)
+        k *= w
 
     if exists(kv_mask):
         mask = kv_mask[:, None, :, None]
@@ -265,7 +264,7 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3, 
     return attn.reshape(*q.shape)
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, heads, seq_len, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0., **kwargs):
+    def __init__(self, dim, heads, seq_len, use_toeplitz=False, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0., **kwargs):
         super().__init__()
         assert dim_head or (dim % heads) == 0, 'embedding dimension must be divisible by number of heads'
         d_heads = default(dim_head, dim // heads)
@@ -291,6 +290,7 @@ class SelfAttention(nn.Module):
         self.to_out = nn.Linear(d_heads * heads, dim)
         self.dropout = nn.Dropout(dropout)
         self.toeplitz_weight = nn.Parameter(torch.randn(1, seq_len))
+        self.use_toeplitz = use_toeplitz
 
     def forward(self, x, input_mask = None, context = None, context_mask = None, pos_emb = None, **kwargs):
         assert not (self.receives_context and not exists(context)), 'context must be supplied if self attention is in receives context mode'
@@ -323,7 +323,10 @@ class SelfAttention(nn.Module):
 
         if has_global:
             kv_mask = input_mask if not self.receives_context else context_mask
-            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask, toeplitz_weight=self.toeplitz_weight)
+            if self.use_toeplitz:
+                global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask, toeplitz_weight=self.toeplitz_weight)
+            else:
+                global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask, toeplitz_weight=None)
             out.append(global_out)
 
         attn = torch.cat(out, dim=1)
@@ -374,7 +377,8 @@ class LinearAttentionTransformer(nn.Module):
         pkm_num_keys = 128,
         linformer_settings = None,
         context_linformer_settings = None,
-        shift_tokens = False
+        shift_tokens = False,
+        use_toeplitz=False
     ):
         super().__init__()
         assert not (causal and exists(linformer_settings)), 'Linformer self attention layer can only be used for non-causal networks'
@@ -474,7 +478,8 @@ class LinearAttentionTransformerLM(nn.Module):
         context_linformer_settings = None,
         use_axial_pos_emb = True,
         use_rotary_emb = False,
-        shift_tokens = False
+        shift_tokens = False,
+        use_toeplitz=False
     ):
         assert n_local_attn_heads == 0 or (max_seq_len % local_attn_window_size) == 0, 'max sequence length must be divisible by the local attention window size'
         super().__init__()
@@ -493,7 +498,7 @@ class LinearAttentionTransformerLM(nn.Module):
             self.pos_emb = AbsolutePositionalEmbedding(emb_dim, max_seq_len)
             self.layer_pos_emb = always(None)
 
-        self.transformer = LinearAttentionTransformer(dim, depth, max_seq_len, heads = heads, dim_head = dim_head, causal = causal, ff_chunks = ff_chunks, ff_glu = ff_glu, ff_dropout = ff_dropout, attn_layer_dropout = attn_layer_dropout, attn_dropout = attn_dropout, reversible = reversible, blindspot_size = blindspot_size, n_local_attn_heads = n_local_attn_heads, local_attn_window_size = local_attn_window_size, receives_context = receives_context, pkm_layers = pkm_layers, pkm_num_keys = pkm_num_keys, attend_axially = attend_axially, linformer_settings = linformer_settings, context_linformer_settings = context_linformer_settings, shift_tokens = shift_tokens)
+        self.transformer = LinearAttentionTransformer(dim, depth, max_seq_len, heads = heads, dim_head = dim_head, causal = causal, ff_chunks = ff_chunks, ff_glu = ff_glu, ff_dropout = ff_dropout, attn_layer_dropout = attn_layer_dropout, attn_dropout = attn_dropout, reversible = reversible, blindspot_size = blindspot_size, n_local_attn_heads = n_local_attn_heads, local_attn_window_size = local_attn_window_size, receives_context = receives_context, pkm_layers = pkm_layers, pkm_num_keys = pkm_num_keys, attend_axially = attend_axially, linformer_settings = linformer_settings, context_linformer_settings = context_linformer_settings, shift_tokens = shift_tokens, use_toeplitz=use_toeplitz)
 
         if emb_dim != dim:
             self.transformer = ProjectInOut(self.transformer, emb_dim, dim, project_out = not return_embeddings)
