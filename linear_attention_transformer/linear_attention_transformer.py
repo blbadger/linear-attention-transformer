@@ -200,8 +200,7 @@ class FeedForward(nn.Module):
         return x
 
 # self attention layer
-
-def linear_attn(q, k, v, kv_mask = None):
+def linear_attn(q, k, v, kv_mask = None, toeplitz_weight=None):
     dim = q.shape[-1]
 
     if exists(kv_mask):
@@ -211,16 +210,20 @@ def linear_attn(q, k, v, kv_mask = None):
         v = v.masked_fill_(~mask, 0.)
         del mask
 
+    # q, k, v are shape [b, h, t, e]
     q = q.softmax(dim=-1)
     k = k.softmax(dim=-2)
 
     q = q * dim ** -0.5
 
     context = einsum('bhnd,bhne->bhde', k, v)
+    # context is [b, h, e, e]
     attn = einsum('bhnd,bhde->bhne', q, context)
+    # attn is shape [b, h, t, e]
+
     return attn.reshape(*q.shape)
 
-def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
+def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3, toeplitz_weight=None):
     b, h, n, e, dtype = *q.shape, q.dtype
     bucket_size = default(bucket_size, 64)
     bucket_size = max(bucket_size, 1)
@@ -230,6 +233,10 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
     k = torch.exp(k).type(dtype).clone()
 
     q = q * e ** -0.5
+    # if toeplitz_weight is not None:
+    #     # print ('Toep weight applied')
+    #     w = torch.unsqueeze(toeplitz_weight, dim=-1)
+    #     q *= w
 
     if exists(kv_mask):
         mask = kv_mask[:, None, :, None]
@@ -253,12 +260,12 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3):
         b_k_cumsum = F.pad(b_k_cumsum, (0, 0, 1, 0), value = 0.)
         b_k_cumsum, _ = split_at_index(2, -1, b_k_cumsum)
 
-    D_inv = 1. / einsum('bhud,bhund->bhun', b_k_cumsum, b_q).clamp(min = eps)
+    D_inv = einsum('bhud,bhund->bhun', b_k_cumsum, b_q) #.clamp(min = eps)  # 1. /
     attn = einsum('bhund,bhude,bhun->bhune', b_q, context, D_inv)
     return attn.reshape(*q.shape)
 
 class SelfAttention(nn.Module):
-    def __init__(self, dim, heads, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0.):
+    def __init__(self, dim, heads, seq_len, causal = False, dim_head = None, blindspot_size = 1, n_local_attn_heads = 0, local_attn_window_size = 128, receives_context = False, dropout = 0., attn_dropout = 0., **kwargs):
         super().__init__()
         assert dim_head or (dim % heads) == 0, 'embedding dimension must be divisible by number of heads'
         d_heads = default(dim_head, dim // heads)
@@ -283,6 +290,7 @@ class SelfAttention(nn.Module):
 
         self.to_out = nn.Linear(d_heads * heads, dim)
         self.dropout = nn.Dropout(dropout)
+        self.toeplitz_weight = nn.Parameter(torch.randn(1, seq_len))
 
     def forward(self, x, input_mask = None, context = None, context_mask = None, pos_emb = None, **kwargs):
         assert not (self.receives_context and not exists(context)), 'context must be supplied if self attention is in receives context mode'
@@ -315,7 +323,7 @@ class SelfAttention(nn.Module):
 
         if has_global:
             kv_mask = input_mask if not self.receives_context else context_mask
-            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask)
+            global_out = self.global_attn_fn(q, k, v, kv_mask = kv_mask, toeplitz_weight=self.toeplitz_weight)
             out.append(global_out)
 
         attn = torch.cat(out, dim=1)
@@ -388,7 +396,7 @@ class LinearAttentionTransformer(nn.Module):
             parallel_net = Chunk(ff_chunks, FeedForward(dim), along_dim = 1) if not use_pkm else PKM(dim)
 
             if not exists(linformer_settings):
-                attn = SelfAttention(dim, heads, causal, dim_head = dim_head, blindspot_size = blindspot_size, n_local_attn_heads = local_heads, local_attn_window_size = local_attn_window_size, dropout = attn_layer_dropout, attn_dropout= attn_dropout)
+                attn = SelfAttention(dim, heads, max_seq_len, causal=causal, dim_head = dim_head, blindspot_size = blindspot_size, n_local_attn_heads = local_heads, local_attn_window_size = local_attn_window_size, dropout = attn_layer_dropout, attn_dropout= attn_dropout)
             else:
                 attn = LinformerSelfAttention(dim, max_seq_len, heads = heads, dim_head = dim_head, dropout = attn_dropout, **linformer_settings._asdict())
 
