@@ -235,7 +235,7 @@ def causal_linear_attn(q, k, v, kv_mask = None, bucket_size = None, eps = 1e-3, 
     q = q * e ** -0.5
     if toeplitz_weight is not None:
         w = torch.unsqueeze(toeplitz_weight, dim=-1)
-        q *= w
+        k *= w
 
     if exists(kv_mask):
         mask = kv_mask[:, None, :, None]
